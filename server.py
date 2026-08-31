@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import time
@@ -6,16 +5,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
 
 
 MUDREX_BASE_URL = "https://trade.mudrex.com/fapi/v1/price"
 
 PORT = int(os.environ.get("PORT", "10000"))
-
 
 INTERVAL_SECONDS = {
     "1m": 60,
@@ -47,6 +45,47 @@ class MudrexAPIError(Exception):
         )
 
 
+def normalize_asset(asset):
+
+    asset = asset.strip().upper()
+
+    asset = asset.replace("-", "/")
+
+    if "/" not in asset and asset.endswith("USDT"):
+        asset = asset[:-4] + "/USDT"
+
+    return asset
+
+
+def get_time_range(interval, limit):
+
+    interval = interval.lower()
+
+    if interval not in INTERVAL_SECONDS:
+        raise ValueError(
+            "Unsupported interval: " + interval
+        )
+
+    end_time = int(time.time())
+
+    start_time = (
+        end_time
+        - INTERVAL_SECONDS[interval] * limit
+    )
+
+    if start_time <= 0:
+        raise ValueError(
+            "start_time must be greater than 0"
+        )
+
+    if end_time <= 0:
+        raise ValueError(
+            "end_time must be greater than 0"
+        )
+
+    return start_time, end_time
+
+
 def mudrex_get(endpoint, params):
 
     url = (
@@ -61,7 +100,8 @@ def mudrex_get(endpoint, params):
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "Mudrex-Market-Data-MCP/6.0",
+            "User-Agent":
+                "Mudrex-Market-Data-MCP/7.0",
         },
         method="GET",
     )
@@ -118,55 +158,6 @@ def mudrex_get(endpoint, params):
         )
 
 
-def normalize_asset(asset):
-
-    asset = asset.strip().upper()
-
-    asset = asset.replace("-", "/")
-
-    if (
-        "/" not in asset
-        and asset.endswith("USDT")
-    ):
-        asset = (
-            asset[:-4]
-            + "/USDT"
-        )
-
-    return asset
-
-
-def get_time_range(interval, limit):
-
-    if interval not in INTERVAL_SECONDS:
-
-        raise ValueError(
-            "Unsupported interval: "
-            + interval
-        )
-
-    end_time = int(time.time())
-
-    start_time = (
-        end_time
-        - INTERVAL_SECONDS[interval] * limit
-    )
-
-    if start_time <= 0:
-
-        raise ValueError(
-            "start_time must be greater than 0"
-        )
-
-    if end_time <= 0:
-
-        raise ValueError(
-            "end_time must be greater than 0"
-        )
-
-    return start_time, end_time
-
-
 def fetch_klines(
     assets="BTC/USDT",
     interval="1h",
@@ -184,26 +175,16 @@ def fetch_klines(
         min(limit, 1440)
     )
 
-    start_time, end_time = (
-        get_time_range(
-            interval,
-            limit
-        )
+    start_time, end_time = get_time_range(
+        interval,
+        limit
     )
 
     params = {
-
-        "assets":
-            assets,
-
-        "aggregation":
-            interval,
-
-        "start_time":
-            start_time,
-
-        "end_time":
-            end_time,
+        "assets": assets,
+        "aggregation": interval,
+        "start_time": start_time,
+        "end_time": end_time,
     }
 
     _, data = mudrex_get(
@@ -236,26 +217,16 @@ def fetch_mark_klines(
         min(limit, 1440)
     )
 
-    start_time, end_time = (
-        get_time_range(
-            interval,
-            limit
-        )
+    start_time, end_time = get_time_range(
+        interval,
+        limit
     )
 
     params = {
-
-        "assets":
-            assets,
-
-        "aggregation":
-            interval,
-
-        "start_time":
-            start_time,
-
-        "end_time":
-            end_time,
+        "assets": assets,
+        "aggregation": interval,
+        "start_time": start_time,
+        "end_time": end_time,
     }
 
     _, data = mudrex_get(
@@ -271,12 +242,14 @@ def fetch_mark_klines(
     }
 
 
-# --------------------------------------------------
-# MCP SERVER
-# --------------------------------------------------
+# ==================================================
+# MCP SERVER — MCP SDK V2
+# ==================================================
 
-mcp = FastMCP(
-    "Mudrex Market Data"
+mcp = MCPServer(
+    "Mudrex Market Data",
+    "Mudrex cryptocurrency market data server",
+    "7.0.0",
 )
 
 
@@ -287,10 +260,9 @@ def get_klines(
     limit: int = 500,
 ) -> dict:
     """
-    Get historical OHLCV candlestick data
-    from the public Mudrex market-data API.
+    Get historical OHLCV candles from Mudrex.
 
-    assets examples:
+    Example assets:
     BTC/USDT
     ETH/USDT
     SOL/USDT
@@ -298,7 +270,7 @@ def get_klines(
     Supported intervals:
     1m, 3m, 5m, 15m, 30m,
     1h, 2h, 4h, 6h, 8h,
-    12h, 1d, 3d, 1w
+    12h, 1d, 3d, 1w.
 
     Maximum 1440 candles.
     """
@@ -373,9 +345,7 @@ def get_market_data(
     limit: int = 500,
 ) -> dict:
     """
-    Convenience tool for crypto market analysis.
-
-    Returns OHLCV candle data from Mudrex.
+    Get Mudrex OHLCV market data for analysis.
     """
 
     return get_klines(
@@ -385,72 +355,42 @@ def get_market_data(
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # HEALTH ENDPOINT
-# --------------------------------------------------
+# ==================================================
 
+@mcp.custom_route(
+    "/health",
+    methods=["GET"]
+)
 async def health(request: Request):
 
     return JSONResponse({
-
         "status": "ok",
-
         "service":
             "mudrex-market-data-mcp",
-
-        "provider":
-            "Mudrex",
-
-        "mcp":
-            "/mcp",
-
-        "version":
-            "6.0.0",
+        "provider": "Mudrex",
+        "mcp": "/mcp",
+        "version": "7.0.0",
     })
 
 
-# --------------------------------------------------
+# ==================================================
+# PUBLIC HOST SECURITY
+# ==================================================
+
+security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False
+)
+
+
+# ==================================================
 # ASGI APPLICATION
-# --------------------------------------------------
+# ==================================================
 
-mcp_app = mcp.streamable_http_app()
-
-
-async def application(
-    scope,
-    receive,
-    send
-):
-
-    if scope["type"] == "http":
-
-        path = scope.get(
-            "path",
-            ""
-        )
-
-        if path == "/health":
-
-            response = await health(
-                Request(
-                    scope,
-                    receive
-                )
-            )
-
-            await response(
-                scope,
-                receive,
-                send
-            )
-
-            return
-
-    await mcp_app(
-        scope,
-        receive,
-        send
-    )
+app = mcp.streamable_http_app(
+    transport_security=security
+)
 
 
 if __name__ == "__main__":
@@ -458,7 +398,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print(
-        "Starting Mudrex Market Data MCP"
+        "Starting Mudrex Market Data MCP v7"
     )
 
     print(
@@ -470,7 +410,7 @@ if __name__ == "__main__":
     )
 
     uvicorn.run(
-        application,
+        "server:app",
         host="0.0.0.0",
         port=PORT,
-    )
+)
