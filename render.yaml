@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: mudrex-market-data-mcp
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
