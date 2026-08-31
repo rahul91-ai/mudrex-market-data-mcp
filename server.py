@@ -1,5 +1,6 @@
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,41 +10,120 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 
 def mudrex_get(endpoint, params=None):
-    url = MUDREX_BASE_URL + endpoint
+    url = MUDREX_BASE_URL.rstrip("/") + "/" + endpoint.lstrip("/")
 
     if params:
-        clean_params = {
+        params = {
             key: value
             for key, value in params.items()
             if value is not None and value != ""
         }
-        if clean_params:
-            url += "?" + urllib.parse.urlencode(clean_params)
+
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
 
     request = urllib.request.Request(
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "mudrex-market-data-mcp/1.0",
+            "User-Agent": "Mudrex-Market-Data-MCP/1.0",
         },
         method="GET",
     )
 
-    with urllib.request.urlopen(request, timeout=20) as response:
-        body = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
 
-    return json.loads(body)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                data = body
+
+            return {
+                "http_status": response.status,
+                "url": url,
+                "data": data,
+            }
+
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode("utf-8", errors="replace")
+
+        try:
+            error_data = json.loads(error_body)
+        except json.JSONDecodeError:
+            error_data = error_body
+
+        raise MudrexAPIError(
+            error.code,
+            url,
+            error_data,
+        )
+
+    except urllib.error.URLError as error:
+        raise MudrexAPIError(
+            502,
+            url,
+            {
+                "error": "Unable to connect to Mudrex",
+                "details": str(error.reason),
+            },
+        )
+
+
+class MudrexAPIError(Exception):
+
+    def __init__(self, status, url, body):
+        self.status = status
+        self.url = url
+        self.body = body
+
+        super().__init__(
+            f"Mudrex API returned HTTP {status}"
+        )
+
+
+def get_query(query, name, default=None):
+    values = query.get(name)
+
+    if not values:
+        return default
+
+    return values[0]
 
 
 class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, data, status=200):
-        body = json.dumps(data).encode("utf-8")
+
+        body = json.dumps(
+            data,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
 
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*",
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-cache",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+
         self.end_headers()
 
         self.wfile.write(body)
@@ -51,138 +131,303 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
 
         parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
 
-        # Health check for Render
-        if path == "/" or path == "/health":
+        path = parsed.path
+
+        query = urllib.parse.parse_qs(
+            parsed.query
+        )
+
+        # --------------------------------------------------
+        # HEALTH
+        # --------------------------------------------------
+
+        if path in ("/", "/health"):
+
             self.send_json({
                 "status": "ok",
                 "service": "mudrex-market-data-mcp",
-                "market_data": "Mudrex public API",
-                "base_url": MUDREX_BASE_URL
+                "provider": "Mudrex",
             })
+
             return
 
-        # API information
+        # --------------------------------------------------
+        # INFORMATION
+        # --------------------------------------------------
+
         if path == "/info":
+
             self.send_json({
                 "name": "Mudrex Market Data MCP",
-                "version": "1.0.0",
+                "version": "2.0.0",
+                "provider": "Mudrex",
+                "public_market_data": True,
                 "endpoints": {
                     "health": "/health",
                     "info": "/info",
-                    "klines": "/klines?symbol=BTC/USDT&interval=4h&limit=500",
-                    "mark_klines": "/mark-klines?symbol=BTC/USDT&interval=4h&limit=500"
-                }
+                    "klines": "/klines",
+                    "mark_klines": "/mark-klines",
+                },
+                "example": (
+                    "/klines"
+                    "?symbol=BTC%2FUSDT"
+                    "&interval=4h"
+                    "&limit=10"
+                ),
             })
+
             return
 
-        # Historical OHLCV candles
+        # --------------------------------------------------
+        # HISTORICAL KLINES
+        # --------------------------------------------------
+
         if path == "/klines":
-            symbol = query.get("symbol", ["BTC/USDT"])[0]
-            interval = query.get("interval", ["1h"])[0]
-            limit = query.get("limit", ["500"])[0]
+
+            symbol = get_query(
+                query,
+                "symbol",
+                "BTC/USDT",
+            )
+
+            interval = get_query(
+                query,
+                "interval",
+                "1h",
+            )
+
+            limit = get_query(
+                query,
+                "limit",
+                "500",
+            )
+
+            # Normalize common symbol formats.
+            symbol = symbol.strip().upper()
+
+            symbol = symbol.replace(
+                "-",
+                "/",
+            )
+
+            if "/" not in symbol and symbol.endswith("USDT"):
+
+                symbol = (
+                    symbol[:-4]
+                    + "/USDT"
+                )
 
             try:
-                limit = min(max(int(limit), 1), 1440)
+
+                limit_int = int(limit)
+
             except ValueError:
+
                 self.send_json({
-                    "error": "limit must be an integer"
+                    "success": False,
+                    "error": "limit must be an integer",
                 }, 400)
+
                 return
 
+            if limit_int < 1:
+
+                limit_int = 1
+
+            if limit_int > 1440:
+
+                limit_int = 1440
+
             try:
-                data = mudrex_get(
+
+                result = mudrex_get(
                     "/kline",
                     {
                         "symbol": symbol,
                         "interval": interval,
-                        "limit": limit
-                    }
+                        "limit": limit_int,
+                    },
                 )
 
                 self.send_json({
                     "success": True,
                     "source": "Mudrex",
-                    "symbol": symbol,
-                    "interval": interval,
-                    "limit": limit,
-                    "data": data
+                    "endpoint": "/price/kline",
+                    "request": {
+                        "symbol": symbol,
+                        "interval": interval,
+                        "limit": limit_int,
+                    },
+                    "data": result["data"],
                 })
 
-            except Exception as error:
+            except MudrexAPIError as error:
+
                 self.send_json({
                     "success": False,
-                    "error": str(error)
-                }, 502)
+                    "source": "Mudrex",
+                    "mudrex_http_status": error.status,
+                    "request_url": error.url,
+                    "mudrex_response": error.body,
+                }, error.status)
+
+            except Exception as error:
+
+                self.send_json({
+                    "success": False,
+                    "error": str(error),
+                }, 500)
 
             return
 
-        # Historical mark-price candles
+        # --------------------------------------------------
+        # MARK PRICE KLINES
+        # --------------------------------------------------
+
         if path == "/mark-klines":
-            symbol = query.get("symbol", ["BTC/USDT"])[0]
-            interval = query.get("interval", ["1h"])[0]
-            limit = query.get("limit", ["500"])[0]
+
+            symbol = get_query(
+                query,
+                "symbol",
+                "BTC/USDT",
+            )
+
+            interval = get_query(
+                query,
+                "interval",
+                "1h",
+            )
+
+            limit = get_query(
+                query,
+                "limit",
+                "500",
+            )
+
+            symbol = symbol.strip().upper()
+
+            symbol = symbol.replace(
+                "-",
+                "/",
+            )
+
+            if "/" not in symbol and symbol.endswith("USDT"):
+
+                symbol = (
+                    symbol[:-4]
+                    + "/USDT"
+                )
 
             try:
-                limit = min(max(int(limit), 1), 1440)
+
+                limit_int = int(limit)
+
             except ValueError:
+
                 self.send_json({
-                    "error": "limit must be an integer"
+                    "success": False,
+                    "error": "limit must be an integer",
                 }, 400)
+
                 return
 
+            limit_int = max(
+                1,
+                min(limit_int, 1440),
+            )
+
             try:
-                data = mudrex_get(
+
+                result = mudrex_get(
                     "/mark-kline",
                     {
                         "symbol": symbol,
                         "interval": interval,
-                        "limit": limit
-                    }
+                        "limit": limit_int,
+                    },
                 )
 
                 self.send_json({
                     "success": True,
                     "source": "Mudrex",
-                    "symbol": symbol,
-                    "interval": interval,
-                    "limit": limit,
-                    "data": data
+                    "endpoint": "/price/mark-kline",
+                    "request": {
+                        "symbol": symbol,
+                        "interval": interval,
+                        "limit": limit_int,
+                    },
+                    "data": result["data"],
                 })
 
-            except Exception as error:
+            except MudrexAPIError as error:
+
                 self.send_json({
                     "success": False,
-                    "error": str(error)
-                }, 502)
+                    "source": "Mudrex",
+                    "mudrex_http_status": error.status,
+                    "request_url": error.url,
+                    "mudrex_response": error.body,
+                }, error.status)
+
+            except Exception as error:
+
+                self.send_json({
+                    "success": False,
+                    "error": str(error),
+                }, 500)
 
             return
 
+        # --------------------------------------------------
+        # 404
+        # --------------------------------------------------
+
         self.send_json({
-            "error": "Not found",
+            "success": False,
+            "error": "Endpoint not found",
             "available_endpoints": [
                 "/health",
                 "/info",
                 "/klines",
-                "/mark-klines"
-            ]
+                "/mark-klines",
+            ],
         }, 404)
 
     def log_message(self, format, *args):
-        print(format % args)
+
+        print(
+            "[HTTP]",
+            format % args,
+        )
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
 
-    print(f"Mudrex market-data server running on port {PORT}")
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        Handler,
+    )
+
+    print(
+        "Mudrex Market Data server started"
+    )
+
+    print(
+        f"Listening on 0.0.0.0:{PORT}"
+    )
 
     try:
+
         server.serve_forever()
+
     except KeyboardInterrupt:
-        pass
+
+        print(
+            "Server shutting down..."
+        )
+
     finally:
+
         server.server_close()
     
