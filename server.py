@@ -9,6 +9,14 @@ MUDREX_BASE_URL = "https://trade.mudrex.com/fapi/v1/price"
 PORT = int(os.environ.get("PORT", "10000"))
 
 
+class MudrexAPIError(Exception):
+    def __init__(self, status, url, body):
+        self.status = status
+        self.url = url
+        self.body = body
+        super().__init__(f"Mudrex API returned HTTP {status}")
+
+
 def mudrex_get(endpoint, params=None):
     url = MUDREX_BASE_URL.rstrip("/") + "/" + endpoint.lstrip("/")
 
@@ -19,8 +27,7 @@ def mudrex_get(endpoint, params=None):
             if value is not None and value != ""
         }
 
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
+        url += "?" + urllib.parse.urlencode(params)
 
     request = urllib.request.Request(
         url,
@@ -40,24 +47,20 @@ def mudrex_get(endpoint, params=None):
             except json.JSONDecodeError:
                 data = body
 
-            return {
-                "http_status": response.status,
-                "url": url,
-                "data": data,
-            }
+            return response.status, data
 
     except urllib.error.HTTPError as error:
-        error_body = error.read().decode("utf-8", errors="replace")
+        body = error.read().decode("utf-8", errors="replace")
 
         try:
-            error_data = json.loads(error_body)
+            data = json.loads(body)
         except json.JSONDecodeError:
-            error_data = error_body
+            data = body
 
         raise MudrexAPIError(
             error.code,
             url,
-            error_data,
+            data,
         )
 
     except urllib.error.URLError as error:
@@ -71,16 +74,15 @@ def mudrex_get(endpoint, params=None):
         )
 
 
-class MudrexAPIError(Exception):
+def normalize_asset(value):
+    value = value.strip().upper()
 
-    def __init__(self, status, url, body):
-        self.status = status
-        self.url = url
-        self.body = body
+    value = value.replace("-", "/")
 
-        super().__init__(
-            f"Mudrex API returned HTTP {status}"
-        )
+    if "/" not in value and value.endswith("USDT"):
+        value = value[:-4] + "/USDT"
+
+    return value
 
 
 def get_query(query, name, default=None):
@@ -95,7 +97,6 @@ def get_query(query, name, default=None):
 class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, data, status=200):
-
         body = json.dumps(
             data,
             separators=(",", ":"),
@@ -131,16 +132,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
 
         parsed = urllib.parse.urlparse(self.path)
-
         path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
 
-        query = urllib.parse.parse_qs(
-            parsed.query
-        )
-
-        # --------------------------------------------------
+        # -----------------------------
         # HEALTH
-        # --------------------------------------------------
+        # -----------------------------
 
         if path in ("/", "/health"):
 
@@ -152,17 +149,17 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # --------------------------------------------------
-        # INFORMATION
-        # --------------------------------------------------
+        # -----------------------------
+        # INFO
+        # -----------------------------
 
         if path == "/info":
 
             self.send_json({
                 "name": "Mudrex Market Data MCP",
-                "version": "2.0.0",
+                "version": "3.0.0",
                 "provider": "Mudrex",
-                "public_market_data": True,
+                "market_data": "public",
                 "endpoints": {
                     "health": "/health",
                     "info": "/info",
@@ -171,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "example": (
                     "/klines"
-                    "?symbol=BTC%2FUSDT"
+                    "?assets=BTC%2FUSDT"
                     "&interval=4h"
                     "&limit=10"
                 ),
@@ -179,17 +176,30 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # --------------------------------------------------
+        # -----------------------------
         # HISTORICAL KLINES
-        # --------------------------------------------------
+        # -----------------------------
 
         if path == "/klines":
 
-            symbol = get_query(
+            # IMPORTANT:
+            # Mudrex requires "assets".
+            assets = get_query(
                 query,
-                "symbol",
-                "BTC/USDT",
+                "assets",
+                None,
             )
+
+            # Also accept symbol as a convenience,
+            # but convert it to assets internally.
+            if not assets:
+                assets = get_query(
+                    query,
+                    "symbol",
+                    "BTC/USDT",
+                )
+
+            assets = normalize_asset(assets)
 
             interval = get_query(
                 query,
@@ -203,25 +213,8 @@ class Handler(BaseHTTPRequestHandler):
                 "500",
             )
 
-            # Normalize common symbol formats.
-            symbol = symbol.strip().upper()
-
-            symbol = symbol.replace(
-                "-",
-                "/",
-            )
-
-            if "/" not in symbol and symbol.endswith("USDT"):
-
-                symbol = (
-                    symbol[:-4]
-                    + "/USDT"
-                )
-
             try:
-
-                limit_int = int(limit)
-
+                limit = int(limit)
             except ValueError:
 
                 self.send_json({
@@ -231,22 +224,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
-            if limit_int < 1:
-
-                limit_int = 1
-
-            if limit_int > 1440:
-
-                limit_int = 1440
+            limit = max(
+                1,
+                min(limit, 1440),
+            )
 
             try:
 
-                result = mudrex_get(
+                status, data = mudrex_get(
                     "/kline",
                     {
-                        "symbol": symbol,
+                        "assets": assets,
                         "interval": interval,
-                        "limit": limit_int,
+                        "limit": limit,
                     },
                 )
 
@@ -255,11 +245,11 @@ class Handler(BaseHTTPRequestHandler):
                     "source": "Mudrex",
                     "endpoint": "/price/kline",
                     "request": {
-                        "symbol": symbol,
+                        "assets": assets,
                         "interval": interval,
-                        "limit": limit_int,
+                        "limit": limit,
                     },
-                    "data": result["data"],
+                    "data": data,
                 })
 
             except MudrexAPIError as error:
@@ -281,17 +271,26 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # --------------------------------------------------
+        # -----------------------------
         # MARK PRICE KLINES
-        # --------------------------------------------------
+        # -----------------------------
 
         if path == "/mark-klines":
 
-            symbol = get_query(
+            assets = get_query(
                 query,
-                "symbol",
-                "BTC/USDT",
+                "assets",
+                None,
             )
+
+            if not assets:
+                assets = get_query(
+                    query,
+                    "symbol",
+                    "BTC/USDT",
+                )
+
+            assets = normalize_asset(assets)
 
             interval = get_query(
                 query,
@@ -305,24 +304,8 @@ class Handler(BaseHTTPRequestHandler):
                 "500",
             )
 
-            symbol = symbol.strip().upper()
-
-            symbol = symbol.replace(
-                "-",
-                "/",
-            )
-
-            if "/" not in symbol and symbol.endswith("USDT"):
-
-                symbol = (
-                    symbol[:-4]
-                    + "/USDT"
-                )
-
             try:
-
-                limit_int = int(limit)
-
+                limit = int(limit)
             except ValueError:
 
                 self.send_json({
@@ -332,19 +315,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 return
 
-            limit_int = max(
+            limit = max(
                 1,
-                min(limit_int, 1440),
+                min(limit, 1440),
             )
 
             try:
 
-                result = mudrex_get(
+                status, data = mudrex_get(
                     "/mark-kline",
                     {
-                        "symbol": symbol,
+                        "assets": assets,
                         "interval": interval,
-                        "limit": limit_int,
+                        "limit": limit,
                     },
                 )
 
@@ -353,11 +336,11 @@ class Handler(BaseHTTPRequestHandler):
                     "source": "Mudrex",
                     "endpoint": "/price/mark-kline",
                     "request": {
-                        "symbol": symbol,
+                        "assets": assets,
                         "interval": interval,
-                        "limit": limit_int,
+                        "limit": limit,
                     },
-                    "data": result["data"],
+                    "data": data,
                 })
 
             except MudrexAPIError as error:
@@ -379,9 +362,9 @@ class Handler(BaseHTTPRequestHandler):
 
             return
 
-        # --------------------------------------------------
-        # 404
-        # --------------------------------------------------
+        # -----------------------------
+        # NOT FOUND
+        # -----------------------------
 
         self.send_json({
             "success": False,
@@ -394,12 +377,9 @@ class Handler(BaseHTTPRequestHandler):
             ],
         }, 404)
 
-    def log_message(self, format, *args):
 
-        print(
-            "[HTTP]",
-            format % args,
-        )
+    def log_message(self, format, *args):
+        print("[HTTP]", format % args)
 
 
 if __name__ == "__main__":
@@ -410,24 +390,14 @@ if __name__ == "__main__":
     )
 
     print(
-        "Mudrex Market Data server started"
-    )
-
-    print(
-        f"Listening on 0.0.0.0:{PORT}"
+        f"Mudrex Market Data server running on port {PORT}"
     )
 
     try:
-
         server.serve_forever()
 
     except KeyboardInterrupt:
-
-        print(
-            "Server shutting down..."
-        )
+        print("Server shutting down...")
 
     finally:
-
         server.server_close()
-    
