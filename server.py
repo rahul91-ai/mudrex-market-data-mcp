@@ -35,33 +35,22 @@ class MudrexAPIError(Exception):
         self.status = status
         self.url = url
         self.body = body
-
-        super().__init__(
-            f"Mudrex API returned HTTP {status}"
-        )
+        super().__init__(f"Mudrex API returned HTTP {status}")
 
 
 def mudrex_get(endpoint, params):
 
-    url = (
-        MUDREX_BASE_URL.rstrip("/")
-        + "/"
-        + endpoint.lstrip("/")
-    )
+    url = MUDREX_BASE_URL.rstrip("/") + "/" + endpoint.lstrip("/")
 
-    params = {
-        key: value
-        for key, value in params.items()
-        if value is not None
-    }
+    query = urllib.parse.urlencode(params)
 
-    url += "?" + urllib.parse.urlencode(params)
+    url += "?" + query
 
     request = urllib.request.Request(
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "Mudrex-Market-Data-MCP/4.0",
+            "User-Agent": "Mudrex-Market-Data-MCP/5.0",
         },
         method="GET",
     )
@@ -73,9 +62,7 @@ def mudrex_get(endpoint, params):
             timeout=30
         ) as response:
 
-            body = response.read().decode(
-                "utf-8"
-            )
+            body = response.read().decode("utf-8")
 
             try:
                 data = json.loads(body)
@@ -109,7 +96,7 @@ def mudrex_get(endpoint, params):
             url,
             {
                 "error": "Unable to connect to Mudrex",
-                "details": str(error.reason),
+                "details": str(error.reason)
             }
         )
 
@@ -120,16 +107,55 @@ def normalize_asset(asset):
 
     asset = asset.replace("-", "/")
 
-    if "/" not in asset:
-
-        if asset.endswith("USDT"):
-
-            asset = (
-                asset[:-4]
-                + "/USDT"
-            )
+    if "/" not in asset and asset.endswith("USDT"):
+        asset = asset[:-4] + "/USDT"
 
     return asset
+
+
+def parse_request_query(parsed):
+
+    query = urllib.parse.parse_qs(
+        parsed.query,
+        keep_blank_values=True
+    )
+
+    # Handle incorrectly encoded URLs such as:
+    #
+    # assets=BTC/USDT%26interval=4h%26limit=10
+    #
+    # This makes the server tolerant of the malformed
+    # URL that was used during testing.
+
+    if "assets" in query:
+
+        raw_assets = query["assets"][0]
+
+        if "%26" in raw_assets:
+            raw_assets = urllib.parse.unquote(
+                raw_assets
+            )
+
+        if "&" in raw_assets:
+
+            parts = raw_assets.split("&")
+
+            query["assets"] = [parts[0]]
+
+            for part in parts[1:]:
+
+                if "=" in part:
+
+                    key, value = part.split(
+                        "=",
+                        1
+                    )
+
+                    query[key.lower()] = [
+                        value
+                    ]
+
+    return query
 
 
 def get_query(query, name, default=None):
@@ -142,43 +168,52 @@ def get_query(query, name, default=None):
     return values[0]
 
 
-def calculate_time_range(interval, limit):
+def get_time_range(interval, limit):
 
-    seconds = INTERVAL_SECONDS.get(
-        interval
-    )
-
-    if seconds is None:
+    if interval not in INTERVAL_SECONDS:
 
         raise ValueError(
-            "Unsupported interval. "
-            "Supported intervals: "
-            + ", ".join(
-                INTERVAL_SECONDS.keys()
-            )
+            "Unsupported interval: "
+            + interval
         )
 
-    end = int(time.time())
+    now = int(time.time())
 
-    start = end - (
-        seconds * limit
+    seconds = INTERVAL_SECONDS[interval]
+
+    end_time = now
+
+    start_time = (
+        end_time
+        - seconds * limit
     )
 
-    return start, end
+    if start_time <= 0:
+        raise ValueError(
+            "Calculated start_time must be greater than 0"
+        )
+
+    if end_time <= 0:
+        raise ValueError(
+            "Calculated end_time must be greater than 0"
+        )
+
+    if start_time >= end_time:
+        raise ValueError(
+            "start_time must be less than end_time"
+        )
+
+    return start_time, end_time
 
 
 class Handler(BaseHTTPRequestHandler):
 
-    def send_json(
-        self,
-        data,
-        status=200
-    ):
+    def send_json(self, data, status=200):
 
         body = json.dumps(
             data,
             separators=(",", ":"),
-            ensure_ascii=False,
+            ensure_ascii=False
         ).encode("utf-8")
 
         self.send_response(status)
@@ -207,6 +242,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self.wfile.write(body)
 
+
     def do_GET(self):
 
         parsed = urllib.parse.urlparse(
@@ -215,8 +251,8 @@ class Handler(BaseHTTPRequestHandler):
 
         path = parsed.path
 
-        query = urllib.parse.parse_qs(
-            parsed.query
+        query = parse_request_query(
+            parsed
         )
 
         # -------------------------
@@ -230,10 +266,11 @@ class Handler(BaseHTTPRequestHandler):
                 "service":
                     "mudrex-market-data-mcp",
                 "provider": "Mudrex",
-                "version": "4.0.0",
+                "version": "5.0.0"
             })
 
             return
+
 
         # -------------------------
         # INFO
@@ -247,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Mudrex Market Data MCP",
 
                 "version":
-                    "4.0.0",
+                    "5.0.0",
 
                 "provider":
                     "Mudrex",
@@ -264,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
                         "/klines",
 
                     "mark_klines":
-                        "/mark-klines",
+                        "/mark-klines"
                 },
 
                 "example":
@@ -273,11 +310,14 @@ class Handler(BaseHTTPRequestHandler):
                     "&interval=4h"
                     "&limit=10",
 
-                "automatic_timestamps":
-                    True,
+                "supported_intervals":
+                    list(
+                        INTERVAL_SECONDS.keys()
+                    )
             })
 
             return
+
 
         # -------------------------
         # KLINES
@@ -306,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
                 query,
                 "interval",
                 "1h"
-            )
+            ).lower()
 
             limit_value = get_query(
                 query,
@@ -337,8 +377,8 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                start, end = (
-                    calculate_time_range(
+                start_time, end_time = (
+                    get_time_range(
                         interval,
                         limit
                     )
@@ -358,24 +398,21 @@ class Handler(BaseHTTPRequestHandler):
                 "assets":
                     assets,
 
-                "interval":
+                "aggregation":
                     interval,
 
-                "start":
-                    start,
+                "start_time":
+                    start_time,
 
-                "end":
-                    end,
-
+                "end_time":
+                    end_time
             }
 
             try:
 
-                status, data = (
-                    mudrex_get(
-                        "/kline",
-                        params
-                    )
+                status, data = mudrex_get(
+                    "/kline",
+                    params
                 )
 
                 self.send_json({
@@ -393,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
                         params,
 
                     "data":
-                        data,
+                        data
                 })
 
             except MudrexAPIError as error:
@@ -413,14 +450,15 @@ class Handler(BaseHTTPRequestHandler):
                         error.url,
 
                     "mudrex_response":
-                        error.body,
+                        error.body
 
                 }, error.status)
 
             return
 
+
         # -------------------------
-        # MARK KLINES
+        # MARK PRICE KLINES
         # -------------------------
 
         if path == "/mark-klines":
@@ -446,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
                 query,
                 "interval",
                 "1h"
-            )
+            ).lower()
 
             limit_value = get_query(
                 query,
@@ -477,8 +515,8 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                start, end = (
-                    calculate_time_range(
+                start_time, end_time = (
+                    get_time_range(
                         interval,
                         limit
                     )
@@ -498,24 +536,21 @@ class Handler(BaseHTTPRequestHandler):
                 "assets":
                     assets,
 
-                "interval":
+                "aggregation":
                     interval,
 
-                "start":
-                    start,
+                "start_time":
+                    start_time,
 
-                "end":
-                    end,
-
+                "end_time":
+                    end_time
             }
 
             try:
 
-                status, data = (
-                    mudrex_get(
-                        "/mark-kline",
-                        params
-                    )
+                status, data = mudrex_get(
+                    "/mark-kline",
+                    params
                 )
 
                 self.send_json({
@@ -533,7 +568,7 @@ class Handler(BaseHTTPRequestHandler):
                         params,
 
                     "data":
-                        data,
+                        data
                 })
 
             except MudrexAPIError as error:
@@ -553,11 +588,12 @@ class Handler(BaseHTTPRequestHandler):
                         error.url,
 
                     "mudrex_response":
-                        error.body,
+                        error.body
 
                 }, error.status)
 
             return
+
 
         # -------------------------
         # 404
@@ -572,16 +608,11 @@ class Handler(BaseHTTPRequestHandler):
                 "Endpoint not found",
 
             "available_endpoints": [
-
                 "/health",
-
                 "/info",
-
                 "/klines",
-
-                "/mark-klines",
-
-            ],
+                "/mark-klines"
+            ]
 
         }, 404)
 
